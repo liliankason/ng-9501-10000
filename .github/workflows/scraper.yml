@@ -1,0 +1,76 @@
+name: MyJobMag Nigeria Scraper
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"    # safety net: restarts the chain if it ever breaks
+  workflow_dispatch: {}       # manual "Run workflow" trigger
+
+permissions:
+  contents: write   # commit CSV + state back to the repo
+  actions: write    # lets the run re-trigger itself (continuous mode)
+
+concurrency:
+  group: myjobmag-ng-scraper
+  cancel-in-progress: false   # never kill a run mid-scrape; queue instead
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Pull latest changes
+        run: git pull --ff-only origin "${{ github.ref_name }}"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        env:
+          START_PAGE: "9501"
+          END_PAGE: "10000"
+          PAGES_PER_RUN: "15"
+          MAX_RUN_SECONDS: "1080"
+        run: python myjobmag_scraper.py
+
+      - name: Commit progress files
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A ng*.csv ng_state.txt 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore: update Nigeria scrape progress [skip ci]"
+            git pull --rebase origin "${{ github.ref_name }}" || true
+            if ! git push origin "HEAD:${{ github.ref_name }}"; then
+              echo "❌ git push FAILED — check Settings → Actions → General → Workflow permissions (needs 'Read and write')."
+              exit 1
+            fi
+            echo "✅ Progress committed and pushed."
+          fi
+
+      # Continuous mode: if pages remain, immediately queue the next run.
+      - name: Trigger next run if not finished
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          NEXT=$(cat ng_state.txt 2>/dev/null || echo 9501)
+          if [ "$NEXT" -le 10000 ]; then
+            echo "Next page is $NEXT — queuing another run."
+            gh workflow run "${{ github.workflow }}" --ref "${{ github.ref_name }}"
+          else
+            echo "🏁 All pages scraped (next would be $NEXT). Not re-triggering."
+          fi
